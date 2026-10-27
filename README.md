@@ -1,5 +1,7 @@
 # jobq
 
+[![tests](https://github.com/decentralizeallengineering/jobq/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/jobq/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 One door for heavy jobs across a handful of machines. Every job runs in its own systemd user unit inside a cgroup slice, so a test run or a build cannot starve the rest of the box.
 
 Why: with several people or agents sharing a few machines, unbounded `pytest` or build runs pile up and hang each other. `jobq` puts each class of job behind a
