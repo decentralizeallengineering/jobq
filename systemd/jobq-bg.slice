@@ -1,0 +1,4 @@
+# ~/.config/systemd/user/jobq-bg.slice : tests, benches and long work yield to everything else
+[Slice]
+CPUWeight=20
+IOWeight=10

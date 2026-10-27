@@ -1,0 +1,4 @@
+# ~/.config/systemd/user/jobq-light.slice : small jobs, lint, index rebuilds
+[Slice]
+CPUWeight=50
+MemoryMax=6G

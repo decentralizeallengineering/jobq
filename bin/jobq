@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""jobq: one door for heavy jobs across a few machines, each job in its own systemd unit inside a cgroup slice.
+
+  jobq run NAME [--class C] [--node N] [--cwd DIR] [--no-sync] -- CMD...   run CMD (blocks, streams output, returns its exit code)
+  jobq ls [--node N]       show the queue file of a node          jobq tail NAME [-f] [--node N]   journal of a running unit
+  jobq sync [--node N] [--cwd DIR]   rsync a checkout under sync_roots to a node
+
+Classes (test, bench, light, work, gate by default) set the slice, the number of concurrent slots (flock), memory and runtime caps.
+Without --node, auto classes go to the configured node with room (free memory, load per core, CPU temperature, no thermal hold),
+else to default_node; other classes go to default_node. With no nodes configured, everything runs on this machine.
+Config: $JOBQ_CONFIG or ~/.config/jobq/config.toml (see config.example.toml). Exit codes: 2 usage or missing directory,
+3 refused because the node is too hot or on hold, 4 refused by a pre-check."""
+import argparse, concurrent.futures, copy, fcntl, glob, json, os, shlex, shutil, socket, subprocess, sys, time
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
+HWMON = "/sys/class/hwmon"
+MEMINFO = "/proc/meminfo"
+BASE_PATH = os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:/bin"
+DEFAULTS = {
+    "default_node": "", "remote_bin": "jobq", "max_load": 0.75, "max_temp_c": 65.0, "need_gb": 6.0, "probe_timeout_s": 8,
+    "queue": "~/.cache/jobq/queue.tsv", "state_dir": "~/.cache/jobq", "slot_dir": "",
+    "sync_roots": [], "sync_excludes": ["/.git", "/.venv", "__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info", "*.key"],
+    "link_from": "", "linked": [".venv"], "nodes": {},
+    "classes": {
+        "test": {"slice": "jobq-bg.slice", "slots": 3, "auto": True, "nice": 10, "yield_to": "gate", "yield_slots": 1},
+        "bench": {"slice": "jobq-bg.slice", "slots": 1, "auto": True, "nice": 10},
+        "light": {"slice": "jobq-light.slice", "slots": 2, "auto": True, "nice": 10},
+        "work": {"slice": "jobq-bg.slice", "slots": 1, "auto": True, "nice": 10, "runtime_max": 3600},
+        "gate": {"slice": "jobq-gate.slice", "slots": 1, "auto": False, "nice": 0, "serialize": True},
+    },
+}
+
+
+def load_config(path=None):
+    path = path or os.environ.get("JOBQ_CONFIG") or os.path.expanduser("~/.config/jobq/config.toml")
+    cfg = copy.deepcopy(DEFAULTS)
+    if os.path.exists(path):
+        if tomllib is None:
+            sys.exit("jobq: reading %s needs Python 3.11 or newer" % path)
+        with open(path, "rb") as f:
+            user = tomllib.load(f)
+        for k, v in user.items():
+            if k == "classes":
+                for c, d in v.items():
+                    cfg["classes"].setdefault(c, {}).update(d)
+            else:
+                cfg[k] = v
+    for n, nd in cfg["nodes"].items():
+        nd.setdefault("ssh", n)
+        nd.setdefault("hostname", nd["ssh"])
+    return cfg
+
+
+CFG = load_config()
+
+
+def slot_dir():
+    return CFG["slot_dir"] or os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+
+
+def state_path(name):
+    return os.path.join(os.path.expanduser(CFG["state_dir"]), name)
+
+
+def queue_path():
+    return os.path.expanduser(CFG["queue"])
+
+
+# ---------------------------------------------------------------- thermal hooks
+# An external monitor may write <state_dir>/jobq.cap (an integer slot cap while warm) and <state_dir>/no-new-jobs (hold file).
+def thermal_cap():
+    try:
+        with open(state_path("jobq.cap")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def thermal_block():
+    return os.path.exists(state_path("no-new-jobs"))
+
+
+# ---------------------------------------------------------------- slots
+def take_slot(n, d=None, prefix="jobq-slot"):
+    """Hold one of n slots (flock); blocks when all are busy. Returns (index, open file)."""
+    n = max(1, min(n, thermal_cap() or n))
+    d = d or slot_dir()
+    files = [open(os.path.join(d, "%s.%d" % (prefix, i)), "a") for i in range(n)]
+    for i, f in enumerate(files):
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            continue
+        for g in files[:i] + files[i + 1:]:
+            g.close()
+        return i, f
+    i = os.getpid() % n
+    for g in files[:i] + files[i + 1:]:
+        g.close()
+    fcntl.flock(files[i], fcntl.LOCK_EX)
+    return i, files[i]
+
+
+def class_running(cls, d=None):
+    """True while a job of this class holds its first slot (flock probe)."""
+    path = os.path.join(d or slot_dir(), "jobq-slot-%s.0" % cls)
+    if not os.path.exists(path):
+        return False
+    with open(path, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- nodes and probes
+def here():
+    """Name of the configured node this host is, or None."""
+    me = socket.gethostname()
+    return next((n for n, nd in CFG["nodes"].items() if nd["hostname"] == me), None)
+
+
+def cpu_temp_c(sysfs=None):
+    """CPU temperature in C from hwmon: AMD k10temp Tctl, else Intel coretemp 'Package id 0'. None when unreadable."""
+    sysfs = sysfs or HWMON
+    try:
+        for h in sorted(os.listdir(sysfs)):
+            d = os.path.join(sysfs, h)
+            with open(os.path.join(d, "name")) as f:
+                name = f.read().strip()
+            want = {"k10temp": "Tctl", "coretemp": "Package id 0"}.get(name)
+            if not want:
+                continue
+            for lab in sorted(glob.glob(os.path.join(d, "temp*_label"))):
+                with open(lab) as f:
+                    if f.read().strip() == want:
+                        with open(lab[:-len("label")] + "input") as g:
+                            return int(g.read()) / 1000.0
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# One short ssh per remote candidate. Prints mem=<MemAvailable kB> load=<load1> nproc=<n> temp=<millidegrees or empty> block=<0|1>.
+PROBE_SH = (
+    "echo mem=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo); echo load=$(cut -d' ' -f1 /proc/loadavg); echo nproc=$(nproc); "
+    "t=; c=; for h in /sys/class/hwmon/hwmon*; do n=$(cat $h/name 2>/dev/null); for l in $h/temp*_label; do [ -e \"$l\" ] || continue; v=$(cat \"$l\"); "
+    "if [ \"$n\" = k10temp ] && [ \"$v\" = Tctl ]; then t=$(cat \"${l%_label}_input\"); break 2; fi; "
+    "if [ \"$n\" = coretemp ] && [ \"$v\" = 'Package id 0' ] && [ -z \"$c\" ]; then c=$(cat \"${l%_label}_input\"); fi; done; done; "
+    "echo temp=${t:-$c}; [ -e ~/.cache/jobq/no-new-jobs ] && echo block=1 || echo block=0")
+
+
+def parse_probe(text):
+    """Parse PROBE_SH output into {avail_gb, ratio, temp, block}; None when mem, load or nproc is missing."""
+    kv = dict(ln.split("=", 1) for ln in text.splitlines() if "=" in ln)
+    try:
+        nproc = max(1, int(kv["nproc"]))
+        return {"avail_gb": int(kv["mem"]) / 1048576.0, "ratio": float(kv["load"]) / nproc,
+                "temp": (int(kv["temp"]) / 1000.0) if kv.get("temp", "").strip() else None, "block": kv.get("block", "0").strip() == "1"}
+    except (KeyError, ValueError):
+        return None
+
+
+def probe_local():
+    try:
+        with open(MEMINFO) as f:
+            mem = next(int(ln.split()[1]) for ln in f if ln.startswith("MemAvailable:"))
+        nproc = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        return {"avail_gb": mem / 1048576.0, "ratio": os.getloadavg()[0] / max(1, nproc), "temp": cpu_temp_c(), "block": thermal_block()}
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+def probe_remote(node):
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", CFG["nodes"][node]["ssh"], PROBE_SH],
+                             capture_output=True, text=True, timeout=CFG["probe_timeout_s"])
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return parse_probe(out.stdout) if out.returncode == 0 else None
+
+
+def quiet_markers(node):
+    """Paths from the node's quiet_globs that exist now; a node with markers takes no new automatic work."""
+    return [m for p in CFG["nodes"][node].get("quiet_globs", []) for m in glob.glob(os.path.expanduser(p))]
+
+
+def qualifies(node, s, need_gb, quiet=()):
+    if s is None or s["avail_gb"] < need_gb or s["ratio"] >= CFG["max_load"] or s["block"] or quiet:
+        return False
+    return s["temp"] is None or s["temp"] < CFG["max_temp_c"]
+
+
+def auto_node():
+    """Probe all nodes in parallel; pick the qualifying one with the lowest load per core (ties: most free memory), else default_node."""
+    need = float(os.environ.get("JOBQ_NEED_GB", CFG["need_gb"]))
+    me = here()
+    names = list(CFG["nodes"])
+    with concurrent.futures.ThreadPoolExecutor(len(names)) as ex:
+        futs = {n: ex.submit(probe_local) if n == me else ex.submit(probe_remote, n) for n in names}
+        stats = {n: f.result() for n, f in futs.items()}
+    ok = sorted((n for n in names if qualifies(n, stats[n], need, quiet_markers(n) if n == me else ())),
+                key=lambda n: (stats[n]["ratio"], -stats[n]["avail_gb"]))
+    node = ok[0] if ok else CFG["default_node"]
+    s = stats.get(node)
+    figs = ("%.1fG avail, load/core %.2f, %s" % (s["avail_gb"], s["ratio"], "temp ?" if s["temp"] is None else "%.0f C" % s["temp"])) if s else "unreachable"
+    print("jobq: auto -> %s (%s%s)" % (node, "" if ok else "fallback, no node qualified; ", figs), file=sys.stderr)
+    return node
+
+
+def pick_node(cls, node):
+    """Explicit --node wins. Else auto classes use auto_node(); others use default_node. '' means run here (no nodes configured)."""
+    if node:
+        if node not in CFG["nodes"]:
+            sys.exit("jobq: unknown node %s (configured: %s)" % (node, ", ".join(CFG["nodes"]) or "none"))
+        return node
+    if not CFG["nodes"]:
+        return ""
+    if CFG["classes"][cls].get("auto") and len(CFG["nodes"]) > 1:
+        return auto_node()
+    return CFG["default_node"] or next(iter(CFG["nodes"]))
+
+
+# ---------------------------------------------------------------- units
+def safe(name):
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in name)
+
+
+def unit_path(cwd):
+    """User units get a bare PATH; put the nearest .venv/bin (cwd or a parent) first so `pytest` resolves."""
+    d = os.path.abspath(cwd)
+    while True:
+        v = os.path.join(d, ".venv", "bin")
+        if os.path.isdir(v):
+            return v + ":" + BASE_PATH
+        if d == os.path.dirname(d):
+            return BASE_PATH
+        d = os.path.dirname(d)
+
+
+def resolve(cmd, cwd):
+    """systemd-run looks up a bare command on systemd's own PATH, not -E PATH: resolve it here."""
+    if cmd and "/" not in cmd[0]:
+        hit = shutil.which(cmd[0], path=unit_path(cwd))
+        if hit:
+            return [hit] + cmd[1:]
+    return cmd
+
+
+def build_unit_cmd(unit, cwd, cmd, cls, node=None):
+    c = CFG["classes"][cls]
+    nd = CFG["nodes"].get(node or "", {})
+    sl = nd.get("slices", {}).get(cls) or c["slice"]
+    out = ["systemd-run", "--user", "--unit", unit, "--slice", sl, "--nice", str(c.get("nice", 10)), "--working-directory", cwd,
+           "--wait", "--pipe", "--collect", "-E", "JOBQ_UNIT=" + unit, "-E", "PATH=" + unit_path(cwd)]
+    for k, v in c.get("env", {}).items():
+        out += ["-E", "%s=%s" % (k, v)]
+    out += ["-p", "KillMode=control-group"]
+    if c.get("memory_max"):
+        out += ["-p", "MemoryMax=" + str(c["memory_max"])]
+    if c.get("runtime_max"):
+        out += ["-p", "RuntimeMaxSec=" + str(c["runtime_max"])]
+    for p in nd.get("properties", []):
+        out += ["-p", p]
+    return out + ["--"] + resolve(cmd, cwd)
+
+
+# ---------------------------------------------------------------- queue file
+def queue_add(row):
+    os.makedirs(os.path.dirname(queue_path()), exist_ok=True)
+    with open(queue_path() + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(queue_path(), "a") as f:
+            f.write("\t".join(row) + "\n")
+
+
+def queue_set(ts, name, state):
+    with open(queue_path() + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(queue_path()) as f:
+            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+        for r in rows:
+            if r[0] == ts and r[1] == name:
+                r[3] = state
+        tmp = queue_path() + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("".join("\t".join(r) + "\n" for r in rows))
+        os.replace(tmp, queue_path())
+
+
+# ---------------------------------------------------------------- local run
+def run_local(a, node=None):
+    cwd = a.cwd or os.getcwd()
+    c = CFG["classes"][a.cls]
+    if not os.path.isdir(cwd):
+        print("jobq: cwd missing on this host: %s" % cwd, file=sys.stderr)
+        return 2
+    if thermal_block():
+        print("jobq: a thermal hold file is present on this node; try again when it clears", file=sys.stderr)
+        return 3
+    t = cpu_temp_c()
+    if CFG["max_temp_c"] and t is not None and t > CFG["max_temp_c"]:
+        print("jobq: refusing new work, CPU at %.0f C (limit %.0f C)" % (t, CFG["max_temp_c"]), file=sys.stderr)
+        return 3
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    name = safe(a.name)
+    unit = "jobq-%s-%s" % (name, ts)
+    queue_add([ts, name, a.cls, "queued", cwd, a.session or os.environ.get("JOBQ_SESSION") or cwd])
+    held = []
+    try:
+        if c.get("serialize"):
+            lk = open(os.path.join(slot_dir(), "jobq-serial-%s.lock" % a.cls), "a")
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            held.append(lk)
+        n = int(c.get("slots", 1))
+        if c.get("yield_to") and class_running(c["yield_to"]):
+            n = int(c.get("yield_slots", n))
+        held.append(take_slot(n, prefix="jobq-slot-%s" % a.cls)[1])
+        queue_set(ts, name, "running")
+        rc = subprocess.call(build_unit_cmd(unit, cwd, a.cmd, a.cls, node))
+    finally:
+        for f in held:
+            f.close()
+    queue_set(ts, name, "done rc=%d" % rc)
+    return rc
+
+
+# ---------------------------------------------------------------- sync
+def syncable(cwd):
+    return any(cwd == os.path.expanduser(r) or cwd.startswith(os.path.expanduser(r).rstrip("/") + "/") for r in CFG["sync_roots"])
+
+
+def sync(a, node=None):
+    """rsync a checkout under sync_roots to the same path on a node (no .git, venv or secrets per sync_excludes), then symlink
+    the 'linked' entries (such as .venv) from the node's own link_from checkout when absent."""
+    node = node or getattr(a, "node", None) or CFG["default_node"]
+    cwd = os.path.abspath(a.cwd or os.getcwd())
+    if node not in CFG["nodes"]:
+        print("jobq: sync needs a configured node", file=sys.stderr)
+        return 2
+    if not syncable(cwd):
+        print("jobq: %s is not under sync_roots" % cwd, file=sys.stderr)
+        return 2
+    host = CFG["nodes"][node]["ssh"]
+    if subprocess.call(["ssh", host, "mkdir", "-p", cwd]) != 0:
+        return 2
+    cmd = ["rsync", "-a", "--delete", "-e", "ssh"] + ["--exclude=" + x for x in CFG["sync_excludes"]] + [cwd + "/", host + ":" + cwd + "/"]
+    rc = subprocess.call(cmd)
+    main = os.path.expanduser(CFG["link_from"])
+    if rc != 0 or not main or cwd == main:
+        return rc
+    link = "; ".join("[ -e {c}/{x} ] || [ -L {c}/{x} ] || ln -s {m}/{x} {c}/{x}".format(c=shlex.quote(cwd), m=shlex.quote(main), x=x) for x in CFG["linked"])
+    return 0 if subprocess.call(["ssh", host, link]) == 0 else 2
+
+
+# ---------------------------------------------------------------- commands
+def run(a):
+    if not a.cmd:
+        print("jobq: no command", file=sys.stderr)
+        return 2
+    a.cls = a.cls or "test"
+    if a.cls not in CFG["classes"]:
+        print("jobq: unknown class %s (known: %s)" % (a.cls, ", ".join(CFG["classes"])), file=sys.stderr)
+        return 2
+    a.cwd = os.path.abspath(a.cwd or os.getcwd())
+    if a.local:
+        return run_local(a, here())
+    node = pick_node(a.cls, a.node)
+    if not node or node == here():
+        return run_local(a, node or None)
+    session = a.session or os.environ.get("JOBQ_SESSION") or a.cwd
+    if syncable(a.cwd) and a.cwd != os.path.expanduser(CFG["link_from"]) and not a.no_sync:
+        if sync(argparse.Namespace(cwd=a.cwd), node) != 0:
+            return 2
+    host = CFG["nodes"][node]["ssh"]
+    if subprocess.call(["ssh", host, "test", "-d", a.cwd]) != 0:
+        print("jobq: cwd missing on %s: %s (jobq sync --node %s)" % (node, a.cwd, node), file=sys.stderr)
+        return 2
+    remote = [CFG["remote_bin"], "run", a.name, "--local", "--node", node, "--class", a.cls, "--cwd", a.cwd, "--session", session, "--"] + a.cmd
+    return subprocess.call(["ssh", host, " ".join(shlex.quote(x) for x in remote)])
+
+
+def on_node(node, args):
+    """Run a command on a node (or here)."""
+    if not node or node == here():
+        return subprocess.call(args)
+    return subprocess.call(["ssh", CFG["nodes"][node]["ssh"], " ".join(shlex.quote(x) for x in args)])
+
+
+def ls(a):
+    return on_node(a.node or CFG["default_node"] or None, ["cat", queue_path()])
+
+
+def tail(a):
+    jc = ["journalctl", "--user", "--no-pager", "-u", "jobq-%s-*" % safe(a.name)] + (["-f"] if a.follow else [])
+    return on_node(a.node or CFG["default_node"] or None, jc)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="jobq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="sub", required=True)
+    r = sp.add_parser("run")
+    r.add_argument("name")
+    r.add_argument("--class", dest="cls", default=None, help="one of the configured classes (default test)")
+    r.add_argument("--node", help="configured node name; default: chosen by class")
+    r.add_argument("--local", action="store_true", help="run on this host without placement (used for the ssh hop)")
+    r.add_argument("--no-sync", action="store_true", help="skip the rsync of a checkout under sync_roots")
+    r.add_argument("--cwd")
+    r.add_argument("--session")
+    r.set_defaults(f=run)
+    ln = sp.add_parser("ls")
+    ln.add_argument("--node")
+    ln.set_defaults(f=ls)
+    y = sp.add_parser("sync")
+    y.add_argument("--node")
+    y.add_argument("--cwd")
+    y.set_defaults(f=sync)
+    t = sp.add_parser("tail")
+    t.add_argument("--node")
+    t.add_argument("name")
+    t.add_argument("-f", "--follow", action="store_true")
+    t.set_defaults(f=tail)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    a = p.parse_args(argv)
+    if a.sub == "run":
+        a.cmd = cmd
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

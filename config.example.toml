@@ -1,0 +1,32 @@
+# jobq config: copy to ~/.config/jobq/config.toml (or set JOBQ_CONFIG). Everything is optional;
+# with no [nodes] section jobq just runs jobs on this machine inside the slices below.
+
+default_node = "big"        # used for non-auto classes and when no node qualifies
+remote_bin   = "jobq"       # how the nodes start jobq (must be on their non-interactive PATH)
+max_load     = 0.75         # auto placement: load1 per core must be under this
+max_temp_c   = 65           # auto placement and local refusal above this CPU temperature (0 disables the local refusal)
+need_gb      = 6            # auto placement: free memory needed (env JOBQ_NEED_GB overrides)
+
+# Checkouts under these roots are rsynced to the same path on a remote node before a job runs there.
+sync_roots = ["~/work"]
+link_from  = "~/work/main"  # on each node, missing entries of `linked` are symlinked from this checkout
+linked     = [".venv", "models"]
+
+[nodes.big]
+ssh      = "big-host"                  # ssh alias; `hostname` defaults to it and is used to recognise "this machine"
+properties = ["MemoryMax=24G"]         # extra systemd properties for every unit on this node
+
+[nodes.small]
+ssh      = "small-host"
+properties = ["MemoryMax=8G", "MemorySwapMax=0", "PrivateDevices=yes", "InaccessiblePaths=/srv/storage"]
+quiet_globs = ["~/work/main/.release-running"]   # while any exists on this node, auto placement skips it
+
+# Override or add classes. Defaults: test, bench, light, work, gate.
+[classes.test]
+slots = 3
+env = { OMP_NUM_THREADS = "2" }
+
+[classes.gate]
+slice = "jobq-gate.slice"
+slots = 1
+serialize = true            # one gate at a time on a node (flock)

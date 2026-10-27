@@ -1,0 +1,4 @@
+# ~/.config/systemd/user/jobq-gate.slice : gates win CPU and IO weight
+[Slice]
+CPUWeight=200
+IOWeight=200

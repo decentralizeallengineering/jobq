@@ -1,0 +1,4 @@
+# ~/.config/systemd/user/jobq.slice : parent of every jobq slice
+[Slice]
+CPUQuota=1200%
+MemoryHigh=20G
